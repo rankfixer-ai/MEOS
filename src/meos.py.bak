@@ -1,0 +1,1088 @@
+﻿"""
+MEOS V0.1 - Minimum Evolutionary Operating System
+The Genome Evolution Architecture
+
+This is the entire system in one file for V0.1.
+"""
+
+import sqlite3
+import json
+import random
+import time
+import os
+from typing import Dict, Any, List, Optional, Tuple
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+# ============================================================
+# DATABASE LAYER
+# ============================================================
+
+class Database:
+    """SQLite database operations."""
+    
+    def __init__(self, db_path: str = "data/meos.db"):
+        self.db_path = db_path
+        self._ensure_db_directory()
+        self._init_tables()
+    
+    def _ensure_db_directory(self):
+        """Ensure the data directory exists."""
+        Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
+    
+    def _init_tables(self):
+        """Initialize all tables."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Genes table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS genes (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT,
+                    best_fitness_ever REAL DEFAULT -1,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            
+            # Alleles table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS alleles (
+                    id TEXT PRIMARY KEY,
+                    gene_id TEXT NOT NULL,
+                    version INTEGER NOT NULL,
+                    genome JSON NOT NULL,
+                    fitness_score REAL,
+                    parent_allele_id TEXT,
+                    is_active BOOLEAN DEFAULT FALSE,
+                    generation INTEGER,
+                    random_seed INTEGER,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (gene_id) REFERENCES genes(id),
+                    FOREIGN KEY (parent_allele_id) REFERENCES alleles(id)
+                )
+            ''')
+            
+            # Lineage table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS lineage (
+                    id TEXT PRIMARY KEY,
+                    parent_allele_id TEXT,
+                    child_allele_id TEXT,
+                    fitness_delta REAL,
+                    selection_reason TEXT,
+                    generation INTEGER,
+                    random_seed INTEGER,
+                    genome_diff JSON,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (parent_allele_id) REFERENCES alleles(id),
+                    FOREIGN KEY (child_allele_id) REFERENCES alleles(id)
+                )
+            ''')
+            
+            # Benchmark results table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS benchmark_results (
+                    id TEXT PRIMARY KEY,
+                    allele_id TEXT NOT NULL,
+                    benchmark_name TEXT NOT NULL,
+                    latency REAL,
+                    accuracy REAL,
+                    cost REAL,
+                    reliability REAL,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (allele_id) REFERENCES alleles(id)
+                )
+            ''')
+            
+            # Experiments table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS experiments (
+                    id TEXT PRIMARY KEY,
+                    gene_id TEXT NOT NULL,
+                    total_generations INTEGER,
+                    random_seed INTEGER,
+                    started_at TIMESTAMP,
+                    completed_at TIMESTAMP,
+                    success BOOLEAN,
+                    notes TEXT,
+                    FOREIGN KEY (gene_id) REFERENCES genes(id)
+                )
+            ''')
+            
+            # Mutation log table
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS mutation_log (
+                    id TEXT PRIMARY KEY,
+                    allele_id TEXT NOT NULL,
+                    mutation_details JSON,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (allele_id) REFERENCES alleles(id)
+                )
+            ''')
+            
+            conn.commit()
+    
+    def _get_connection(self):
+        """Get a database connection."""
+        return sqlite3.connect(self.db_path)
+    
+    def execute(self, query: str, params: tuple = ()):
+        """Execute a query and return results."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            return cursor.fetchall()
+    
+    def execute_many(self, query: str, params_list: list):
+        """Execute many queries."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.executemany(query, params_list)
+            conn.commit()
+    
+    def insert(self, table: str, data: Dict) -> str:
+        """Insert a row and return the ID."""
+        columns = ', '.join(data.keys())
+        placeholders = ', '.join(['?' for _ in data])
+        query = f"INSERT INTO {table} ({columns}) VALUES ({placeholders})"
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, list(data.values()))
+            conn.commit()
+            return cursor.lastrowid if cursor.lastrowid else data.get('id')
+    
+    def update(self, table: str, id: str, data: Dict):
+        """Update a row by ID."""
+        set_clause = ', '.join([f"{k} = ?" for k in data.keys()])
+        query = f"UPDATE {table} SET {set_clause} WHERE id = ?"
+        params = list(data.values()) + [id]
+        
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(query, params)
+            conn.commit()
+
+
+# ============================================================
+# GENOME OPERATIONS
+# ============================================================
+
+class GenomeManager:
+    """Manage genomes and alleles."""
+    
+    def __init__(self, db: Database):
+        self.db = db
+    
+    def create_gene(self, name: str, description: str = "") -> str:
+        """Create a new gene."""
+        import uuid
+        gene_id = str(uuid.uuid4())[:8]
+        self.db.insert('genes', {
+            'id': gene_id,
+            'name': name,
+            'description': description,
+            'best_fitness_ever': -1.0
+        })
+        return gene_id
+    
+    def create_allele(self, gene_id: str, genome: Dict, fitness_score: float = None,
+                      parent_id: str = None, generation: int = 0, seed: int = 42) -> str:
+        """Create a new allele."""
+        import uuid
+        allele_id = str(uuid.uuid4())[:8]
+        
+        # Get current version count
+        rows = self.db.execute(
+            "SELECT COUNT(*) FROM alleles WHERE gene_id = ?",
+            (gene_id,)
+        )
+        version = rows[0][0] + 1 if rows else 1
+        
+        self.db.insert('alleles', {
+            'id': allele_id,
+            'gene_id': gene_id,
+            'version': version,
+            'genome': json.dumps(genome),
+            'fitness_score': fitness_score,
+            'parent_allele_id': parent_id,
+            'is_active': False,
+            'generation': generation,
+            'random_seed': seed
+        })
+        return allele_id
+    
+    def get_active_allele(self, gene_id: str) -> Optional[Dict]:
+        """Get the active allele for a gene."""
+        rows = self.db.execute(
+            "SELECT * FROM alleles WHERE gene_id = ? AND is_active = TRUE LIMIT 1",
+            (gene_id,)
+        )
+        if not rows:
+            return None
+        
+        row = rows[0]
+        return {
+            'id': row[0],
+            'gene_id': row[1],
+            'version': row[2],
+            'genome': json.loads(row[3]),
+            'fitness_score': row[4],
+            'parent_allele_id': row[5],
+            'is_active': row[6],
+            'generation': row[7],
+            'random_seed': row[8],
+            'created_at': row[9]
+        }
+    
+    def set_active_allele(self, allele_id: str):
+        """Set an allele as active."""
+        # Deactivate all others
+        self.db.execute(
+            "UPDATE alleles SET is_active = FALSE WHERE gene_id = (SELECT gene_id FROM alleles WHERE id = ?)",
+            (allele_id,)
+        )
+        # Activate this one
+        self.db.execute(
+            "UPDATE alleles SET is_active = TRUE WHERE id = ?",
+            (allele_id,)
+        )
+    
+    def get_allele(self, allele_id: str) -> Optional[Dict]:
+        """Get an allele by ID."""
+        rows = self.db.execute(
+            "SELECT * FROM alleles WHERE id = ?",
+            (allele_id,)
+        )
+        if not rows:
+            return None
+        
+        row = rows[0]
+        return {
+            'id': row[0],
+            'gene_id': row[1],
+            'version': row[2],
+            'genome': json.loads(row[3]),
+            'fitness_score': row[4],
+            'parent_allele_id': row[5],
+            'is_active': row[6],
+            'generation': row[7],
+            'random_seed': row[8],
+            'created_at': row[9]
+        }
+    
+    def get_lineage(self, gene_id: str) -> List[Dict]:
+        """Get the lineage for a gene."""
+        rows = self.db.execute(
+            "SELECT * FROM lineage WHERE parent_allele_id IN (SELECT id FROM alleles WHERE gene_id = ?) ORDER BY generation",
+            (gene_id,)
+        )
+        return rows
+    
+    def get_best_fitness(self, gene_id: str) -> float:
+        """Get the best fitness ever for a gene."""
+        rows = self.db.execute(
+            "SELECT MAX(fitness_score) FROM alleles WHERE gene_id = ?",
+            (gene_id,)
+        )
+        if rows and rows[0][0] is not None:
+            return rows[0][0]
+        return -1.0
+
+
+# ============================================================
+# MUTATION ENGINE
+# ============================================================
+
+class MutationEngine:
+    """Genetic mutation engine."""
+    
+    def __init__(self, random_seed: int = 42):
+        self.random = random.Random(random_seed)
+        self.mutation_attempts = 0
+        self.mutation_log = []
+    
+    def mutate(self, genome: Dict) -> Tuple[Dict, Dict]:
+        """
+        Mutate a genome. Always mutates at least one parameter.
+        Returns: (new_genome, diff)
+        """
+        self.mutation_attempts += 1
+        new_genome = json.loads(json.dumps(genome))
+        
+        # Determine number of mutations (1-3)
+        num_mutations = self.random.choice([1, 1, 1, 2, 2, 3])
+        
+        diff = {}
+        params_mutated = []
+        
+        for _ in range(num_mutations):
+            # Pick a parameter to mutate
+            available = [p for p in self._get_parameters() if p not in params_mutated]
+            if not available:
+                break
+            
+            param = self.random.choice(available)
+            params_mutated.append(param)
+            
+            old_value = genome[param]
+            new_value = self._mutate_parameter(param, old_value)
+            
+            if new_value != old_value:
+                new_genome[param] = new_value
+                diff[param] = {'old': old_value, 'new': new_value}
+        
+        # Ensure at least one mutation occurred
+        if not diff:
+            # Force a mutation
+            param = self.random.choice(self._get_parameters())
+            old_value = genome[param]
+            new_value = self._mutate_parameter(param, old_value)
+            new_genome[param] = new_value
+            diff[param] = {'old': old_value, 'new': new_value}
+        
+        self.mutation_log.append({
+            'genome': new_genome,
+            'diff': diff,
+            'num_changes': len(diff)
+        })
+        
+        return new_genome, diff
+    
+    def _get_parameters(self) -> List[str]:
+        """Get all mutable parameters."""
+        return [
+            'parallelism',
+            'cache_enabled',
+            'cache_size',
+            'reranking_enabled',
+            'batch_size',
+            'timeout_seconds',
+            'max_results'
+        ]
+    
+    def _mutate_parameter(self, param: str, current: Any) -> Any:
+        """Mutate a single parameter."""
+        if param == 'parallelism':
+            options = [1, 2, 4, 8, 16, 32]
+            return self.random.choice([o for o in options if o != current])
+        
+        elif param == 'cache_enabled':
+            return not current
+        
+        elif param == 'cache_size':
+            options = [0, 100, 1000, 10000, 50000]
+            return self.random.choice([o for o in options if o != current])
+        
+        elif param == 'reranking_enabled':
+            return not current
+        
+        elif param == 'batch_size':
+            options = [1, 5, 10, 20, 50, 100]
+            return self.random.choice([o for o in options if o != current])
+        
+        elif param == 'timeout_seconds':
+            options = [5, 10, 20, 30, 60, 120]
+            return self.random.choice([o for o in options if o != current])
+        
+        elif param == 'max_results':
+            options = [10, 25, 50, 100, 250, 500]
+            return self.random.choice([o for o in options if o != current])
+        
+        return current
+    
+    def get_stats(self) -> Dict:
+        """Get mutation statistics."""
+        return {
+            'attempts': self.mutation_attempts,
+            'log_count': len(self.mutation_log)
+        }
+
+
+# ============================================================
+# FITNESS FUNCTION (FIXED FOR V0.1)
+# ============================================================
+
+class FitnessFunction:
+    """Fitness function - FIXED for V0.1."""
+    
+    def __init__(self):
+        # FIXED weights - DO NOT CHANGE in V0.1
+        self.weights = {
+            'latency': 0.30,
+            'accuracy': 0.40,
+            'cost': 0.20,
+            'reliability': 0.10
+        }
+    
+    def calculate(self, benchmark_results: Dict) -> float:
+        """
+        Calculate fitness from benchmark results.
+        This function is LOCKED for V0.1.
+        """
+        # Normalize each metric to [0, 1]
+        latency_score = 1 / (1 + benchmark_results.get('latency', 1.0))
+        accuracy_score = benchmark_results.get('accuracy', 0.5)
+        cost_score = 1 / (1 + benchmark_results.get('cost', 1.0))
+        reliability_score = benchmark_results.get('reliability', 0.5)
+        
+        # Weighted sum
+        fitness = (
+            self.weights['latency'] * latency_score +
+            self.weights['accuracy'] * accuracy_score +
+            self.weights['cost'] * cost_score +
+            self.weights['reliability'] * reliability_score
+        )
+        
+        return fitness
+
+
+# ============================================================
+# SEARCH CAPABILITY
+# ============================================================
+
+class SearchEngine:
+    """Search capability - configuration driven."""
+    
+    def __init__(self, genome: Dict):
+        self.parallelism = genome.get('parallelism', 1)
+        self.cache_enabled = genome.get('cache_enabled', False)
+        self.cache_size = genome.get('cache_size', 0)
+        self.reranking_enabled = genome.get('reranking_enabled', False)
+        self.batch_size = genome.get('batch_size', 10)
+        self.timeout = genome.get('timeout_seconds', 30)
+        self.max_results = genome.get('max_results', 50)
+        
+        self.cache = {}
+        self.search_count = 0
+        self.success_count = 0
+    
+    def search(self, query: str, sources: List[str]) -> List[Dict]:
+        """
+        Execute a search with configured parameters.
+        """
+        self.search_count += 1
+        
+        # Check cache
+        if self.cache_enabled and query in self.cache:
+            self.success_count += 1
+            return self.cache[query][:self.max_results]
+        
+        # Simulate search with configured parallelism
+        if self.parallelism > 1:
+            results = self._parallel_search(query, sources)
+        else:
+            results = self._sequential_search(query, sources)
+        
+        # Apply reranking if enabled
+        if self.reranking_enabled:
+            results = self._rerank(results)
+        
+        # Limit results
+        results = results[:self.max_results]
+        
+        # Store in cache if enabled
+        if self.cache_enabled:
+            self.cache[query] = results
+            self._prune_cache()
+        
+        self.success_count += 1
+        return results
+    
+    def _sequential_search(self, query: str, sources: List[str]) -> List[Dict]:
+        """Sequential search implementation."""
+        import time
+        results = []
+        
+        # Simulate latency
+        latency = 0.05 * len(sources)  # 50ms per source
+        time.sleep(min(latency, self.timeout))
+        
+        for source in sources[:self.batch_size]:
+            results.append({
+                'source': source,
+                'title': f"{source}: {query[:20]}...",
+                'relevance': random.uniform(0.3, 0.9)
+            })
+        
+        return results
+    
+    def _parallel_search(self, query: str, sources: List[str]) -> List[Dict]:
+        """Parallel search implementation."""
+        import time
+        results = []
+        
+        # Simulate parallel latency
+        latency = 0.05 * max(1, len(sources) / self.parallelism)
+        time.sleep(min(latency, self.timeout))
+        
+        for source in sources[:self.batch_size]:
+            results.append({
+                'source': source,
+                'title': f"{source}: {query[:20]}...",
+                'relevance': random.uniform(0.3, 0.9)
+            })
+        
+        return results
+    
+    def _rerank(self, results: List[Dict]) -> List[Dict]:
+        """Rerank results."""
+        # Simulate reranking - slightly improve relevance scores
+        for result in results:
+            result['relevance'] = min(1.0, result['relevance'] * 1.1)
+        return sorted(results, key=lambda x: x['relevance'], reverse=True)
+    
+    def _prune_cache(self):
+        """Prune cache to maintain size limit."""
+        if len(self.cache) > self.cache_size // 10:
+            # Remove oldest entries
+            items = list(self.cache.items())
+            to_remove = len(items) - (self.cache_size // 10)
+            for key, _ in items[:to_remove]:
+                del self.cache[key]
+    
+    def get_stats(self) -> Dict:
+        """Get search statistics."""
+        return {
+            'search_count': self.search_count,
+            'success_count': self.success_count,
+            'cache_size': len(self.cache)
+        }
+
+
+# ============================================================
+# BENCHMARK RUNNER
+# ============================================================
+
+class BenchmarkRunner:
+    """Run benchmarks on genomes."""
+    
+    def __init__(self, db: Database, fitness: FitnessFunction):
+        self.db = db
+        self.fitness = fitness
+    
+    def run_benchmark(self, allele_id: str, genome: Dict, benchmark_name: str = "default") -> Dict:
+        """
+        Run a benchmark on a genome.
+        Returns benchmark results.
+        """
+        # Create search engine
+        engine = SearchEngine(genome)
+        
+        # Generate test queries
+        queries = self._generate_queries(100)
+        
+        results = {
+            'latency': 0.0,
+            'accuracy': 0.0,
+            'cost': 0.0,
+            'reliability': 0.0
+        }
+        
+        successful_queries = 0
+        total_latency = 0.0
+        total_accuracy = 0.0
+        total_cost = 0.0
+        
+        for query in queries:
+            start_time = time.time()
+            try:
+                result = engine.search(query['text'], query['sources'])
+                end_time = time.time()
+                
+                successful_queries += 1
+                total_latency += (end_time - start_time)
+                total_cost += 0.001 * len(query['sources'])
+                total_accuracy += result[0]['relevance'] if result else 0.5
+                
+            except Exception as e:
+                # Failed query
+                pass
+        
+        # Calculate averages
+        if successful_queries > 0:
+            results['latency'] = total_latency / successful_queries
+            results['accuracy'] = total_accuracy / successful_queries
+            results['cost'] = total_cost / successful_queries
+            results['reliability'] = successful_queries / len(queries)
+        else:
+            results = {
+                'latency': 10.0,
+                'accuracy': 0.0,
+                'cost': 10.0,
+                'reliability': 0.0
+            }
+        
+        # Calculate fitness
+        fitness_score = self.fitness.calculate(results)
+        
+        # Store results
+        self.db.insert('benchmark_results', {
+            'id': allele_id,
+            'allele_id': allele_id,
+            'benchmark_name': benchmark_name,
+            'latency': results['latency'],
+            'accuracy': results['accuracy'],
+            'cost': results['cost'],
+            'reliability': results['reliability']
+        })
+        
+        return {
+            'fitness': fitness_score,
+            'latency': results['latency'],
+            'accuracy': results['accuracy'],
+            'cost': results['cost'],
+            'reliability': results['reliability']
+        }
+    
+    def _generate_queries(self, count: int) -> List[Dict]:
+        """Generate test queries."""
+        import random
+        queries = []
+        source_pool = ['wikipedia', 'github', 'stackoverflow', 'news', 'academic']
+        
+        query_texts = [
+            "how to implement search",
+            "best search algorithm",
+            "search optimization techniques",
+            "parallel search performance",
+            "cache strategies for search",
+            "search relevance ranking",
+            "fast search implementation",
+            "search architecture patterns",
+            "scalable search systems",
+            "search with vectors"
+        ]
+        
+        for _ in range(count):
+            num_sources = random.randint(3, 10)
+            sources = random.sample(source_pool, min(num_sources, len(source_pool)))
+            queries.append({
+                'text': random.choice(query_texts),
+                'sources': sources
+            })
+        
+        return queries
+
+
+# ============================================================
+# EVOLUTION LOOP
+# ============================================================
+
+class EvolutionLoop:
+    """Main evolution loop."""
+    
+    def __init__(self, gene_id: str, db: Database, num_generations: int = 100, seed: int = 42):
+        self.gene_id = gene_id
+        self.db = db
+        self.num_generations = num_generations
+        self.seed = seed
+        self.random = random.Random(seed)
+        
+        self.mutation_engine = MutationEngine(seed)
+        self.fitness = FitnessFunction()
+        self.benchmark_runner = BenchmarkRunner(db, self.fitness)
+        
+        self.best_ever_allele_id = None
+        self.best_ever_fitness = -1.0
+        self.generation_history = []
+    
+    def run(self) -> Dict:
+        """
+        Run the evolution loop.
+        Returns results.
+        """
+        print(f"\n🧬 Starting evolution for gene: {self.gene_id}")
+        print(f"   Generations: {self.num_generations}")
+        print(f"   Seed: {self.seed}")
+        print("-" * 50)
+        
+        # Get active allele
+        active_allele = self._get_active_or_create()
+        self.best_ever_allele_id = active_allele['id']
+        self.best_ever_fitness = active_allele.get('fitness_score', 0.0)
+        
+        success_count = 0
+        reject_count = 0
+        
+        for generation in range(1, self.num_generations + 1):
+            # 1. Mutate active allele
+            new_genome, diff = self.mutation_engine.mutate(active_allele['genome'])
+            
+            # 2. Create new allele
+            import uuid
+            allele_id = str(uuid.uuid4())[:8]
+            
+            self.db.insert('alleles', {
+                'id': allele_id,
+                'gene_id': self.gene_id,
+                'version': generation + 1,
+                'genome': json.dumps(new_genome),
+                'fitness_score': None,
+                'parent_allele_id': active_allele['id'],
+                'is_active': False,
+                'generation': generation,
+                'random_seed': self.seed
+            })
+            
+            # 3. Evaluate
+            benchmark_results = self.benchmark_runner.run_benchmark(allele_id, new_genome)
+            fitness_score = benchmark_results['fitness']
+            
+            # Update allele with fitness
+            self.db.execute(
+                "UPDATE alleles SET fitness_score = ? WHERE id = ?",
+                (fitness_score, allele_id)
+            )
+            
+            # 4. Calculate delta
+            fitness_delta = fitness_score - active_allele.get('fitness_score', 0.0)
+            
+            # 5. Selection
+            if fitness_delta > 0:
+                # Promoted
+                self._promote_allele(allele_id, generation, diff, fitness_delta)
+                active_allele = self._get_allele(allele_id)
+                success_count += 1
+                
+                # Update elite if needed
+                if fitness_score > self.best_ever_fitness:
+                    self.best_ever_fitness = fitness_score
+                    self.best_ever_allele_id = allele_id
+                    self.db.execute(
+                        "UPDATE genes SET best_fitness_ever = ? WHERE id = ?",
+                        (self.best_ever_fitness, self.gene_id)
+                    )
+                
+                status = "✓"
+            else:
+                # Rejected
+                self._reject_allele(allele_id, generation, diff, fitness_delta)
+                reject_count += 1
+                status = "✗"
+            
+            # 6. Log progress
+            if generation % 10 == 0:
+                print(f"   Gen {generation:3d}: {status} Fitness: {fitness_score:.3f} "
+                      f"(Δ: {fitness_delta:+.3f}) Active: {active_allele.get('fitness_score', 0):.3f}")
+            
+            self.generation_history.append({
+                'generation': generation,
+                'fitness': fitness_score,
+                'delta': fitness_delta,
+                'active_fitness': active_allele.get('fitness_score', 0.0),
+                'success': fitness_delta > 0
+            })
+        
+        # Final results
+        print("-" * 50)
+        print(f"✅ Evolution complete!")
+        print(f"   Successes: {success_count}")
+        print(f"   Rejections: {reject_count}")
+        print(f"   Success Rate: {success_count/(success_count+reject_count)*100:.1f}%")
+        print(f"   Best Fitness: {self.best_ever_fitness:.3f}")
+        
+        return {
+            'success_count': success_count,
+            'reject_count': reject_count,
+            'best_fitness': self.best_ever_fitness,
+            'history': self.generation_history,
+            'lineage_length': self._get_lineage_length()
+        }
+    
+    def _get_active_or_create(self) -> Dict:
+        """Get active allele or create initial one."""
+        active = self.db.get_active_allele(self.gene_id)
+        if active:
+            return active
+        
+        # Create initial genome
+        initial_genome = {
+            'parallelism': 1,
+            'cache_enabled': False,
+            'cache_size': 0,
+            'reranking_enabled': False,
+            'batch_size': 10,
+            'timeout_seconds': 30,
+            'max_results': 50
+        }
+        
+        import uuid
+        allele_id = str(uuid.uuid4())[:8]
+        
+        self.db.insert('alleles', {
+            'id': allele_id,
+            'gene_id': self.gene_id,
+            'version': 1,
+            'genome': json.dumps(initial_genome),
+            'fitness_score': None,
+            'parent_allele_id': None,
+            'is_active': False,
+            'generation': 0,
+            'random_seed': self.seed
+        })
+        
+        # Run initial benchmark
+        results = self.benchmark_runner.run_benchmark(allele_id, initial_genome)
+        fitness = results['fitness']
+        
+        self.db.execute(
+            "UPDATE alleles SET fitness_score = ? WHERE id = ?",
+            (fitness, allele_id)
+        )
+        
+        self.db.set_active_allele(allele_id)
+        
+        return self.db.get_allele(allele_id)
+    
+    def _promote_allele(self, allele_id: str, generation: int, diff: Dict, delta: float):
+        """Promote an allele."""
+        self.db.set_active_allele(allele_id)
+        self.db.insert('lineage', {
+            'id': str(uuid.uuid4())[:8],
+            'parent_allele_id': self.db.get_allele(allele_id)['parent_allele_id'],
+            'child_allele_id': allele_id,
+            'fitness_delta': delta,
+            'selection_reason': 'promoted',
+            'generation': generation,
+            'random_seed': self.seed,
+            'genome_diff': json.dumps(diff)
+        })
+    
+    def _reject_allele(self, allele_id: str, generation: int, diff: Dict, delta: float):
+        """Reject an allele."""
+        self.db.insert('lineage', {
+            'id': str(uuid.uuid4())[:8],
+            'parent_allele_id': self.db.get_allele(allele_id)['parent_allele_id'],
+            'child_allele_id': allele_id,
+            'fitness_delta': delta,
+            'selection_reason': 'rejected',
+            'generation': generation,
+            'random_seed': self.seed,
+            'genome_diff': json.dumps(diff)
+        })
+    
+    def _get_allele(self, allele_id: str) -> Dict:
+        """Get an allele by ID."""
+        rows = self.db.execute(
+            "SELECT * FROM alleles WHERE id = ?",
+            (allele_id,)
+        )
+        if rows:
+            row = rows[0]
+            return {
+                'id': row[0],
+                'gene_id': row[1],
+                'version': row[2],
+                'genome': json.loads(row[3]),
+                'fitness_score': row[4],
+                'parent_allele_id': row[5],
+                'is_active': row[6],
+                'generation': row[7],
+                'random_seed': row[8],
+                'created_at': row[9]
+            }
+        return None
+    
+    def _get_lineage_length(self) -> int:
+        """Get lineage length."""
+        rows = self.db.execute(
+            "SELECT COUNT(*) FROM lineage WHERE parent_allele_id IN (SELECT id FROM alleles WHERE gene_id = ?)",
+            (self.gene_id,)
+        )
+        return rows[0][0] if rows else 0
+
+
+# ============================================================
+# EXPERIMENT RUNNER
+# ============================================================
+
+class ExperimentRunner:
+    """Run experiments with multiple seeds."""
+    
+    def __init__(self, db: Database):
+        self.db = db
+    
+    def run(self, gene_id: str, num_generations: int = 100) -> Dict:
+        """Run experiment with multiple seeds."""
+        seeds = [42, 1337, 9001, 12345, 8675309]
+        results = []
+        
+        print(f"\n🧪 Starting experiment for gene: {gene_id}")
+        print(f"   Seeds: {seeds}")
+        print("=" * 60)
+        
+        initial_fitness = self._get_initial_fitness(gene_id)
+        
+        for seed in seeds:
+            print(f"\n📊 Running seed {seed}...")
+            
+            # Start experiment
+            import uuid
+            exp_id = str(uuid.uuid4())[:8]
+            self.db.insert('experiments', {
+                'id': exp_id,
+                'gene_id': gene_id,
+                'total_generations': num_generations,
+                'random_seed': seed,
+                'started_at': datetime.now().isoformat(),
+                'completed_at': None,
+                'success': None,
+                'notes': ''
+            })
+            
+            # Run evolution
+            loop = EvolutionLoop(gene_id, self.db, num_generations, seed)
+            result = loop.run()
+            
+            # Determine success
+            final_fitness = result['best_fitness']
+            improvement = (final_fitness - initial_fitness) / initial_fitness if initial_fitness > 0 else 0
+            
+            success = (
+                improvement > 0.20 and  # 1. > 20% improvement
+                result['success_count'] > 5 and  # 2. > 5 successful mutations
+                result['reject_count'] > result['success_count'] * 0.2 and  # 3. > 20% failure rate
+                result['lineage_length'] > 0  # 4. Lineage exists
+            )
+            
+            # Update experiment
+            self.db.execute(
+                "UPDATE experiments SET completed_at = ?, success = ?, notes = ? WHERE id = ?",
+                (datetime.now().isoformat(), 1 if success else 0, 
+                 f"Improvement: {improvement:.2%}, Successes: {result['success_count']}", exp_id)
+            )
+            
+            results.append({
+                'seed': seed,
+                'success': success,
+                'final_fitness': final_fitness,
+                'improvement': improvement,
+                'success_count': result['success_count'],
+                'reject_count': result['reject_count'],
+                'lineage_length': result['lineage_length']
+            })
+            
+            print(f"   Seed {seed}: {'✅ Success' if success else '❌ Failed'}")
+            print(f"   Final Fitness: {final_fitness:.3f}")
+            print(f"   Improvement: {improvement:.2%}")
+        
+        # Analyze overall success
+        all_succeeded = all(r['success'] for r in results)
+        successful_seeds = sum(1 for r in results if r['success'])
+        
+        print("\n" + "=" * 60)
+        print("📊 EXPERIMENT RESULTS")
+        print(f"   All Seeds Succeeded: {'✅' if all_succeeded else '❌'}")
+        print(f"   Successful Seeds: {successful_seeds}/{len(seeds)}")
+        
+        if all_succeeded:
+            print("\n🎉 MEOS V0.1 SUCCEEDED!")
+            print("   Evolution works! Proceed to V0.2.")
+        else:
+            print("\n⚠️  MEOS V0.1 PARTIALLY FAILED")
+            print("   Check debug checklist.")
+        
+        return {
+            'all_succeeded': all_succeeded,
+            'successful_seeds': successful_seeds,
+            'total_seeds': len(seeds),
+            'results': results
+        }
+    
+    def _get_initial_fitness(self, gene_id: str) -> float:
+        """Get initial fitness for a gene."""
+        rows = self.db.execute(
+            "SELECT fitness_score FROM alleles WHERE gene_id = ? AND is_active = TRUE",
+            (gene_id,)
+        )
+        if rows and rows[0][0] is not None:
+            return rows[0][0]
+        return 0.5
+
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    """Main entry point."""
+    print("🧬 MEOS V0.1 - The Genome Evolution Architecture")
+    print("================================================")
+    
+    # Initialize
+    db = Database()
+    
+    # Create a gene
+    gene_id = db.create_gene("search", "Search capability evolution test")
+    print(f"\n📌 Created gene: {gene_id} (search)")
+    
+    # Create initial allele
+    initial_genome = {
+        "parallelism": 1,
+        "cache_enabled": False,
+        "cache_size": 0,
+        "reranking_enabled": False,
+        "batch_size": 10,
+        "timeout_seconds": 30,
+        "max_results": 50
+    }
+    
+    import uuid
+    allele_id = str(uuid.uuid4())[:8]
+    db.insert('alleles', {
+        'id': allele_id,
+        'gene_id': gene_id,
+        'version': 1,
+        'genome': json.dumps(initial_genome),
+        'fitness_score': None,
+        'parent_allele_id': None,
+        'is_active': False,
+        'generation': 0,
+        'random_seed': 42
+    })
+    
+    # Run initial benchmark
+    fitness = FitnessFunction()
+    benchmark_runner = BenchmarkRunner(db, fitness)
+    results = benchmark_runner.run_benchmark(allele_id, initial_genome)
+    fitness_score = results['fitness']
+    
+    db.execute(
+        "UPDATE alleles SET fitness_score = ? WHERE id = ?",
+        (fitness_score, allele_id)
+    )
+    db.set_active_allele(allele_id)
+    
+    print(f"   Initial fitness: {fitness_score:.3f}")
+    print(f"   Initial genome: {initial_genome}")
+    
+    # Run experiment
+    runner = ExperimentRunner(db)
+    result = runner.run(gene_id, 100)
+    
+    print("\n" + "=" * 60)
+    if result['all_succeeded']:
+        print("🎉 MEOS V0.1 COMPLETED SUCCESSFULLY!")
+        print("   All seeds succeeded. Evolution works.")
+        print("\n✅ Proceed to MEOS V0.2")
+    else:
+        print("⚠️  MEOS V0.1 COMPLETED WITH ISSUES")
+        print(f"   {result['successful_seeds']}/{result['total_seeds']} seeds succeeded.")
+        print("\n   Check debug checklist:")
+        print("   □ Database connection")
+        print("   □ Genome JSON serialization")
+        print("   □ Fitness calculation")
+        print("   □ Mutation engine")
+        print("   □ Selection logic")
+        print("   □ Elite preservation")
+    
+    print("\n📁 Data stored in: data/meos.db")
+    print("📊 Use SQLite to query results.")
+
+
+if __name__ == "__main__":
+    main()
