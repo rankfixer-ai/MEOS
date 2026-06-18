@@ -665,6 +665,7 @@ class EvolutionLoop:
                 if self.champion_stagnation_counter >= self.champion_stagnation_threshold:
                     print(f"   CHAMPION STAGNATION: Forcing macro jump at generation {gen}")
                     self.no_improvement_counter = self.stagnation_threshold  # force macro_jump next mutation
+                    generations_since_improvement = 0  # reset plateau counter on macro jump
 
             if gen % 10 == 0:
                 print(f"   Gen {gen:3d}: {status} Fitness: {fitness_score:.3f} "
