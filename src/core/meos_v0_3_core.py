@@ -482,7 +482,7 @@ class EvolutionLoop:
         self.num_generations = num_generations
         self.seed = seed
         self.baseline_fitness = baseline_fitness
-        self.plateau_generations = plateau_generations
+        self.plateau_generations = max(plateau_generations, 60)
         self.mutation_engine = MutationEngine(seed)
         self.fitness = FitnessFunction()
         self.benchmark_runner = BenchmarkRunner(self.fitness)
@@ -496,6 +496,7 @@ class EvolutionLoop:
         self.champion_stagnation_threshold = 10
         self.elite_archive = []
         self.max_elite_size = 10
+        self.tabu_alleles = []  # recently visited, don't re-select
 
     def _get_active_allele(self) -> Optional[Dict]:
         rows = self.db.execute("SELECT * FROM alleles WHERE gene_id = ? AND is_active = TRUE LIMIT 1", (self.gene_id,))
@@ -536,6 +537,16 @@ class EvolutionLoop:
             "generation": row[8] if len(row) > 8 else 0,
             "random_seed": row[9] if len(row) > 9 else 0
         }
+
+    def _crossover(self, genome_a, genome_b):
+        """Uniform crossover: each parameter randomly from either parent."""
+        child = {}
+        for key in genome_a:
+            if key in genome_b:
+                child[key] = genome_a[key] if self.mutation_engine.random.random() < 0.5 else genome_b[key]
+            else:
+                child[key] = genome_a[key]
+        return child
 
     def _print_archive_summary(self):
         rows = self.db.execute(
@@ -652,7 +663,8 @@ class EvolutionLoop:
                 self.best_ever_allele_id = allele_id
                 self.champion_stagnation_counter = 0
                 self.no_improvement_counter = 0
-                print(f"   NEW CHAMPION: {fitness_score:.4f}")
+                source = "branch" if "P5_branch" in locals() else "direct"
+                print(f"   NEW CHAMPION: {fitness_score:.4f} [{source}]")
             elif stability_score > 0.98 and fitness_delta > -0.005:
                 if random.Random(hashlib.md5(f'{self.seed}:{gen}:soft'.encode()).hexdigest()[:8]).random() < 0.25:
                     accepted = True
@@ -727,6 +739,29 @@ class EvolutionLoop:
                 if self.no_improvement_counter >= 15 and self.elite_archive and len(self.elite_archive) >= 3:
                     print(f"   [V0.4.3] {self.no_improvement_counter} gens without improvement. Switching to archive parent.")
                     self.no_improvement_counter = 0
+                if self.champion_stagnation_counter >= self.champion_stagnation_threshold:
+                    print(f"   [P5] STAGNATION: {self.champion_stagnation_counter} gens. Switching to archive parent.")
+                    alt = self.db.execute(
+                        "SELECT id, genome, fitness_score FROM alleles WHERE gene_id = ? AND fitness_score < ? AND fitness_score IS NOT NULL ORDER BY fitness_score DESC LIMIT 10",
+                        (self.gene_id, self.best_ever_fitness * 0.999)
+                    )
+                    if alt:
+                        import random as _random
+                        alt_id, alt_genome_json, alt_fitness = _random.choice(alt)
+                        alt_genome = json.loads(alt_genome_json)
+                        crossed = self._crossover(self.best_ever_genome, alt_genome)
+                        self.best_ever_genome = crossed
+                        self._set_active_allele(alt_id, "P5_crossover")
+                        self.no_improvement_counter = 0
+                        self.champion_stagnation_counter = 0
+                        print(f"   [P5] Crossover: champion x archive -> new parent")
+                        alt_fit = float(alt_fitness)
+                        print(f"   [P5] Branched from archive allele fitness={alt_fit:.4f}")
+                    else:
+                        self.no_improvement_counter = self.stagnation_threshold
+                elif self.champion_stagnation_counter >= 8:
+                    print(f"   [P5] EXPLORE: {self.champion_stagnation_counter} gens. Boosting mutation.")
+                    self.no_improvement_counter = self.stagnation_threshold
                 self.champion_stagnation_counter += 1
                 status = "?"
 
@@ -870,19 +905,6 @@ def run_evolutionary_loop(seed: int, generations: int, selector: SelectionEngine
     if debug:
         print("DEBUG: Creating EvolutionLoop")
     
-    loop = EvolutionLoop(
-        gene_id=gene_id,
-        db=db,
-        experiment_id=run_id,
-        num_generations=generations,
-        seed=seed,
-        baseline_fitness=baseline_fitness,
-        initial_allele_id=allele_id,
-        initial_genome=initial_genome,
-        selector=selector
-    )
-    
-    return loop.run()
 
 if __name__ == "__main__":
     # This block allows direct testing
