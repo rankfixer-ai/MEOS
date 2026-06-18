@@ -16,19 +16,19 @@ cd MEOS
 
 pip install -r requirements.txt
 
-python meos_v0.3.py
+python experiments/meos_v0.3.py
 ```
 
 Run validation:
 
 ```bash
-python verify_v0.2.py
+python legacy/verify_v0.2.py
 ```
 
 Analyze results:
 
 ```bash
-python analyze_results.py
+python analysis/analyze_results.py
 ```
 
 ---
