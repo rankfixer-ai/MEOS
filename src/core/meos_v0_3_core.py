@@ -305,7 +305,7 @@ class MutationEngine:
             "parallelism": [4, 8, 12, 16],
             "cache_enabled": [True, False],
             "cache_size": [0, 100, 500, 1000, 5000],
-            "reranking_enabled": [True],
+            "reranking_enabled": [True, False],
             "batch_size": [30, 40, 50, 60, 75],
             "timeout_seconds": [45, 50, 60, 70, 75],
             "max_results": [5, 10, 15, 20],
@@ -356,10 +356,10 @@ class SearchEngine:
         if self.cache_enabled and query in self.cache:
             return self.cache[query][:self.max_results]
         latency = 0.05 * max(1, len(sources) / max(1, self.parallelism))
-        time.sleep(min(latency, self.timeout))
+        pass  # time.sleep removed for determinism
         results = []
         for i, source in enumerate(sources[:self.batch_size]):
-            self.random.seed(hash(query + source + str(i) + str(self.seed)) % 10000)
+            self.random.seed(int(hashlib.md5((query + source + str(i) + str(self.seed)).encode()).hexdigest(), 16) % 10000)
             results.append({
                 "source": source,
                 "title": f"{source}: {query[:20]}...",
@@ -416,12 +416,12 @@ class BenchmarkRunner:
     def __init__(self, fitness: FitnessFunction):
         self.fitness = fitness
 
-    def run_multi_env_benchmark(self, allele_id: str, genome: Dict) -> Dict:
+    def run_multi_env_benchmark(self, allele_id: str, genome: Dict, gen_seed: int = 42) -> Dict:
         scores = []
         env_results = {}
-        for env_name, env_config in ENVIRONMENTS.items():
-            engine = SearchEngine(genome, seed=hash(allele_id + env_name) % 10000)
-            queries = self._generate_queries(env_config["queries"], env_config["sources"])
+        for env_index, (env_name, env_config) in enumerate(ENVIRONMENTS.items()):
+            engine = SearchEngine(genome, seed=int(hashlib.md5((json.dumps(genome, sort_keys=True) + env_name).encode()).hexdigest(), 16) % 10000)
+            queries = self._generate_queries(env_config["queries"], env_config["sources"], gen_seed + env_index)
             results = {"latency": 0.0, "accuracy": 0.0, "cost": 0.0, "reliability": 0.0}
             successful = 0
             total_latency = 0.0
@@ -429,11 +429,9 @@ class BenchmarkRunner:
             total_cost = 0.0
             for q in queries:
                 try:
-                    start = time.time()
                     result = engine.search(q["text"], q["sources"])
-                    end = time.time()
                     successful += 1
-                    total_latency += (end - start)
+                    total_latency += 0.05 * max(1, len(q["sources"]) / max(1, genome.get("parallelism", 1)))
                     total_cost += 0.001 * len(q["sources"])
                     total_accuracy += result[0]["relevance"] if result else 0.5
                 except:
@@ -452,7 +450,7 @@ class BenchmarkRunner:
         stability = 1 - (max(scores) - min(scores)) / max(1, max(scores))
         return {"fitness": avg_fitness, "env_scores": env_results, "stability": stability}
 
-    def _generate_queries(self, count: int, sources_per_query: int) -> List[Dict]:
+    def _generate_queries(self, count: int, sources_per_query: int, seed: int = 42) -> List[Dict]:
         source_pool = ["wikipedia", "github", "stackoverflow", "news", "academic", "docs", "blog", "forum"]
         query_texts = [
             "how to implement search", "best search algorithm", "search optimization techniques",
@@ -463,8 +461,8 @@ class BenchmarkRunner:
         queries = []
         for _ in range(count):
             num_sources = min(sources_per_query, len(source_pool))
-            sources = random.sample(source_pool, num_sources)
-            queries.append({"text": random.choice(query_texts), "sources": sources})
+            sources = random.Random(seed).sample(source_pool, num_sources)
+            queries.append({"text": random.Random(seed).choice(query_texts), "sources": sources})
         return queries
 
 
@@ -514,9 +512,15 @@ class EvolutionLoop:
             "random_seed": row[9] if len(row) > 9 else 0
         }
 
-    def _set_active_allele(self, allele_id: str):
+    def _set_active_allele(self, allele_id: str, reason: str = ""):
+        old_active = self._get_active_allele()
+        old_fitness = old_active["fitness_score"] if old_active else 0.0
+        new_allele = self._get_allele(allele_id)
+        new_fitness = new_allele["fitness_score"] if new_allele else 0.0
         self.db.execute("UPDATE alleles SET is_active = FALSE WHERE gene_id = (SELECT gene_id FROM alleles WHERE id = ?)", (allele_id,))
         self.db.execute("UPDATE alleles SET is_active = TRUE WHERE id = ?", (allele_id,))
+        if old_active:
+            print(f"   [SWITCH] {old_active['id'][:8]}->{allele_id[:8]} | {old_fitness:.4f}->{new_fitness:.4f} | {reason}")
 
     def _get_allele(self, allele_id: str) -> Optional[Dict]:
         rows = self.db.execute("SELECT * FROM alleles WHERE id = ?", (allele_id,))
@@ -559,7 +563,7 @@ class EvolutionLoop:
         stability_score = results["stability"]
         self.db.execute("UPDATE alleles SET fitness_score = ? WHERE id = ?", (fitness_score, allele_id))
         self.db.execute("UPDATE alleles SET stability_score = ? WHERE id = ?", (stability_score, allele_id))
-        self._set_active_allele(allele_id)
+        self._set_active_allele(allele_id, "baseline")
 
         self.best_ever_fitness = fitness_score
         self.best_ever_allele_id = allele_id
@@ -580,10 +584,16 @@ class EvolutionLoop:
             parent_stability = active.get("stability_score", 0.0)
             # V0.4: Stagnation-aware parent selection
             if hasattr(self, "elite_archive") and self.elite_archive:
-                if self.no_improvement_counter >= 3:
-                    parent_genome = random.choice(self.elite_archive)["genome"]
-                elif random.random() < 0.3:
-                    parent_genome = random.choice(self.elite_archive)["genome"]
+                if self.no_improvement_counter >= 15:
+                    alt_elites = [e for e in self.elite_archive if e['fitness'] < self.best_ever_fitness * 0.995]
+                    if alt_elites:
+                        parent_genome = self.mutation_engine.random.choice(alt_elites)['genome']
+                    else:
+                        parent_genome = self.mutation_engine.random.choice(self.elite_archive)['genome']
+                elif self.no_improvement_counter >= 3:
+                    parent_genome = self.mutation_engine.random.choice(self.elite_archive)['genome']
+                elif self.mutation_engine.random.random() < 0.3:
+                    parent_genome = self.mutation_engine.random.choice(self.elite_archive)['genome']
                 else:
                     parent_genome = self.best_ever_genome if self.best_ever_genome else initial_genome
             else:
@@ -604,7 +614,7 @@ class EvolutionLoop:
                 "generation": gen, "random_seed": self.seed
             })
 
-            results = self.benchmark_runner.run_multi_env_benchmark(allele_id, new_genome)
+            results = self.benchmark_runner.run_multi_env_benchmark(allele_id, new_genome, gen)
             fitness_score = results["fitness"]
             stability_score = results["stability"]
             env_scores = {env: v['fitness'] for env, v in results['env_scores'].items()}
@@ -628,7 +638,7 @@ class EvolutionLoop:
                 self.no_improvement_counter = 0
                 print(f"   NEW CHAMPION: {fitness_score:.4f}")
             elif stability_score > 0.98 and fitness_delta > -0.005:
-                if random.random() < 0.25:
+                if random.Random(hashlib.md5(f'{self.seed}:{gen}:soft'.encode()).hexdigest()[:8]).random() < 0.25:
                     accepted = True
                     evaluation_result = "PROMOTED_SOFT"
                     print(f"   SOFT PROMOTED: {fitness_score:.4f} (stability: {stability_score:.4f})")
@@ -689,7 +699,7 @@ class EvolutionLoop:
                 })
 
             if accepted:
-                self._set_active_allele(allele_id)
+                self._set_active_allele(allele_id, evaluation_result)
                 success_count += 1
                 generations_since_improvement = 0
                 self.no_improvement_counter = 0
@@ -698,6 +708,9 @@ class EvolutionLoop:
                 reject_count += 1
                 generations_since_improvement += 1
                 self.no_improvement_counter += 1
+                if self.no_improvement_counter >= 15 and self.elite_archive and len(self.elite_archive) >= 3:
+                    print(f"   [V0.4.3] {self.no_improvement_counter} gens without improvement. Switching to archive parent.")
+                    self.no_improvement_counter = 0
                 self.champion_stagnation_counter += 1
                 status = "?"
 
@@ -705,6 +718,15 @@ class EvolutionLoop:
                 print(f"   Gen {gen:3d}: {status} Fitness: {fitness_score:.3f} "
                       f"(Delta: {delta_fitness:+.3f}) Active: {parent_fitness:.3f} "
                       f"Stability: {stability_score:.3f} | Result: {evaluation_result}")
+                # P4: Archive diversity check
+                top_alleles = self.db.execute(
+                    "SELECT fitness_score, stability_score, genome FROM alleles WHERE gene_id = ? AND fitness_score IS NOT NULL ORDER BY fitness_score DESC LIMIT 10",
+                    (self.gene_id,)
+                )
+                if len(top_alleles) >= 3:
+                    fitnesses = [float(a[0]) for a in top_alleles if a[0] is not None]
+                    if max(fitnesses) - min(fitnesses) < 0.005:
+                        print(f"   [ARCHIVE] Low diversity: top10 spread={max(fitnesses)-min(fitnesses):.4f}")
 
             current_parent = self._get_active_allele()
             parent_stability = current_parent.get("stability_score", 0) if current_parent else 0
@@ -783,7 +805,7 @@ def run_evolutionary_loop(seed: int, generations: int, selector: SelectionEngine
 
     if debug:
         print("DEBUG: Running initial benchmark")
-    results = benchmark_runner.run_multi_env_benchmark(allele_id, initial_genome)
+    results = benchmark_runner.run_multi_env_benchmark(allele_id, initial_genome, 0)
     baseline_fitness = results["fitness"]
     baseline_stability = results["stability"]
     db.execute("UPDATE alleles SET fitness_score = ? WHERE id = ?", (baseline_fitness, allele_id))
