@@ -27,3 +27,7 @@ class SelectionEngine:
 
     def calculate_combined_score(self, fitness: float, stability: float) -> float:
         return self.w_fitness * fitness + self.w_stability * stability
+
+    def calculate_novelty(self, candidate_genome, archive):
+        # Placeholder for V0.4 logic
+        return 0.0

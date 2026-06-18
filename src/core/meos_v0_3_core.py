@@ -1,4 +1,4 @@
-﻿"""
+"""
 MEOS V0.3 - Core Evolutionary Loop
 Modular implementation with Selection Engine integration
 """
@@ -99,7 +99,10 @@ class Database:
                     evaluation_result TEXT NOT NULL CHECK (
                         evaluation_result IN (
                             "PROMOTED",
+                            "PROMOTED_SOFT",
+                            "PROMOTED_CHAMPION",
                             "REJECTED_FITNESS",
+                            "REJECTED_SOFT",
                             "REJECTED_STABILITY",
                             "REJECTED_GENERALIZATION",
                             "REJECTED_THRESHOLD"
@@ -165,7 +168,7 @@ class Database:
                     me.attributed_delta
                 FROM mutation_trials mt
                 JOIN mutation_events me ON mt.id = me.trial_id
-                WHERE mt.evaluation_result = "PROMOTED"
+                WHERE mt.evaluation_result IN ("PROMOTED", "PROMOTED_SOFT", "PROMOTED_CHAMPION")
             ''')
 
             cursor.execute('''
@@ -191,9 +194,8 @@ class Database:
             conn.commit()
 
     def _get_connection(self):
-        conn = sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
-        conn.row_factory = sqlite3.Row
-        return conn
+        return sqlite3.connect(self.db_path, timeout=30, check_same_thread=False)
+
     def execute(self, query: str, params: tuple = ()):
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -231,7 +233,8 @@ class MutationEngine:
         ).hexdigest()[:16]
 
     def mutate(self, genome: Dict, generation: int, current_fitness: float = None,
-               no_improvement_counter: int = 0, stagnation_threshold: int = 5) -> Tuple[Dict, Dict]:
+               no_improvement_counter: int = 0, stagnation_threshold: int = 5,
+               champion_stagnation_counter: int = 0, champion_stagnation_threshold: int = 10) -> Tuple[Dict, Dict]:
         self.mutation_attempts += 1
         new_genome = json.loads(json.dumps(genome))
 
@@ -241,7 +244,10 @@ class MutationEngine:
                   "cache_eviction_policy", "ranking_model_temp"]
 
         if current_fitness is not None and current_fitness > 0.85:
-            if no_improvement_counter >= stagnation_threshold:
+            if champion_stagnation_counter >= champion_stagnation_threshold:
+                num_mutations = self.random.choice([3, 4, 5, 6, 7])
+                mutation_mode = "champion_macro_jump"
+            elif no_improvement_counter >= stagnation_threshold:
                 num_mutations = self.random.choice([2, 3, 4, 5])
                 mutation_mode = "macro_jump"
             else:
@@ -306,11 +312,7 @@ class MutationEngine:
             "scoring_strategy": ["cosine", "dot", "euclidean"],
             "retrieval_depth": [3, 5, 10, 20],
             "cache_eviction_policy": ["lru", "lfu", "fifo"],
-            "ranking_model_temp": [0.1, 0.3, 0.5, 0.7, 1.0],
-            "ranking_temperature": [0.1, 0.2, 0.3, 0.5, 0.7, 1.0],
-            "scoring_alpha": [0.0, 0.1, 0.2, 0.3, 0.4, 0.5],
-            "retrieval_batch_size": [5, 10, 20, 50, 100],
-            "cache_ttl": [60, 120, 300, 600, 1800]
+            "ranking_model_temp": [0.1, 0.3, 0.5, 0.7, 1.0]
         }
         opts = [o for o in options[param] if o != current]
         return self.random.choice(opts) if opts else current
@@ -418,18 +420,14 @@ class BenchmarkRunner:
         scores = []
         env_results = {}
         for env_name, env_config in ENVIRONMENTS.items():
-            print(f"   ?? [BENCHMARK] Starting environment: {env_name}")
             engine = SearchEngine(genome, seed=hash(allele_id + env_name) % 10000)
             queries = self._generate_queries(env_config["queries"], env_config["sources"])
-            print(f"   ?? [BENCHMARK] Generated {len(queries)} queries for {env_name}")
             results = {"latency": 0.0, "accuracy": 0.0, "cost": 0.0, "reliability": 0.0}
             successful = 0
             total_latency = 0.0
             total_accuracy = 0.0
             total_cost = 0.0
-            for idx, q in enumerate(queries):
-                if idx % 10 == 0:
-                    print(f"   ? [BENCHMARK] Query {idx+1}/{len(queries)} for {env_name}...", end="\r")
+            for q in queries:
                 try:
                     start = time.time()
                     result = engine.search(q["text"], q["sources"])
@@ -478,7 +476,7 @@ class EvolutionLoop:
     def __init__(self, gene_id: str, db: Database, experiment_id: str,
                  num_generations: int = 100, seed: int = 42,
                  baseline_fitness: float = 0.5, plateau_generations: int = 10,
-                 initial_allele_id: str = None, initial_genome: dict = None,
+                 initial_allele_id: str = None, initial_genome: Dict = None,
                  selector: SelectionEngine = None):
         self.gene_id = gene_id
         self.db = db
@@ -498,6 +496,8 @@ class EvolutionLoop:
         self.stagnation_threshold = 5
         self.champion_stagnation_counter = 0
         self.champion_stagnation_threshold = 10
+        self.elite_archive = []
+        self.max_elite_size = 10
 
     def _get_active_allele(self) -> Optional[Dict]:
         rows = self.db.execute("SELECT * FROM alleles WHERE gene_id = ? AND is_active = TRUE LIMIT 1", (self.gene_id,))
@@ -505,13 +505,13 @@ class EvolutionLoop:
             return None
         row = rows[0]
         return {
-            "id": row["id"], "gene_id": row["gene_id"], "version": row["version"],
-            "genome": json.loads(row["genome"]), "fitness_score": float(row["fitness_score"]) if row["fitness_score"] is not None else 0.0,
-            "stability_score": float(row["stability_score"]) if row["stability_score"] is not None else 0.0,
-            "parent_allele_id": row["parent_allele_id"],
-            "is_active": row["is_active"],
-            "generation": row["generation"],
-            "random_seed": row["random_seed"]
+            "id": row[0], "gene_id": row[1], "version": row[2],
+            "genome": json.loads(row[3]), "fitness_score": row[4],
+            "stability_score": float(row[5]) if len(row) > 5 and row[5] is not None else 0.0,
+            "parent_allele_id": row[6] if len(row) > 6 else None,
+            "is_active": row[7] if len(row) > 7 else False,
+            "generation": row[8] if len(row) > 8 else 0,
+            "random_seed": row[9] if len(row) > 9 else 0
         }
 
     def _set_active_allele(self, allele_id: str):
@@ -534,11 +534,36 @@ class EvolutionLoop:
         }
 
     def run(self) -> Dict:
-        print(f"\n?? Starting evolution for seed: {self.seed}")
+        print(f"\nStarting evolution for seed: {self.seed}")
         print(f"   Generations: {self.num_generations}")
         print(f"   Baseline Fitness: {self.baseline_fitness:.3f}")
         print("-" * 50)
 
+        initial_genome = {"parallelism": 1, "cache_enabled": False, "cache_size": 0,
+                          "reranking_enabled": False, "batch_size": 10,
+                          "timeout_seconds": 30, "max_results": 50,
+                          "scoring_strategy": "cosine", "retrieval_depth": 10,
+                          "cache_eviction_policy": "lru", "ranking_model_temp": 0.5}
+
+        allele_id = str(uuid.uuid4())[:8]
+        self.db.insert("alleles", {
+            "id": allele_id, "gene_id": self.gene_id, "version": 1,
+            "genome": json.dumps(initial_genome), "fitness_score": None,
+            "stability_score": None,
+            "parent_allele_id": None, "is_active": False, "generation": 0,
+            "random_seed": self.seed
+        })
+
+        results = self.benchmark_runner.run_multi_env_benchmark(allele_id, initial_genome)
+        fitness_score = results["fitness"]
+        stability_score = results["stability"]
+        self.db.execute("UPDATE alleles SET fitness_score = ? WHERE id = ?", (fitness_score, allele_id))
+        self.db.execute("UPDATE alleles SET stability_score = ? WHERE id = ?", (stability_score, allele_id))
+        self._set_active_allele(allele_id)
+
+        self.best_ever_fitness = fitness_score
+        self.best_ever_allele_id = allele_id
+        self.best_ever_genome = initial_genome.copy()
 
         success_count = 0
         reject_count = 0
@@ -553,11 +578,21 @@ class EvolutionLoop:
 
             parent_fitness = active.get("fitness_score", 0.0)
             parent_stability = active.get("stability_score", 0.0)
-            parent_genome = self.best_ever_genome
+            # V0.4: Stagnation-aware parent selection
+            if hasattr(self, "elite_archive") and self.elite_archive:
+                if self.no_improvement_counter >= 3:
+                    parent_genome = random.choice(self.elite_archive)["genome"]
+                elif random.random() < 0.3:
+                    parent_genome = random.choice(self.elite_archive)["genome"]
+                else:
+                    parent_genome = self.best_ever_genome if self.best_ever_genome else initial_genome
+            else:
+                parent_genome = self.best_ever_genome if self.best_ever_genome else initial_genome
 
             new_genome, diff = self.mutation_engine.mutate(
                 parent_genome, gen, parent_fitness,
-                self.no_improvement_counter, self.stagnation_threshold
+                self.no_improvement_counter, self.stagnation_threshold,
+                self.champion_stagnation_counter, self.champion_stagnation_threshold
             )
             allele_id = str(uuid.uuid4())[:8]
 
@@ -580,10 +615,31 @@ class EvolutionLoop:
 
             delta_fitness = fitness_score - parent_fitness
 
-            accepted, evaluation_result = self.selector.evaluate_candidate(
-                parent_fitness, parent_stability,
-                fitness_score, stability_score
-            )
+            import random
+            fitness_delta = fitness_score - self.best_ever_fitness
+
+            if fitness_score > self.best_ever_fitness:
+                accepted = True
+                evaluation_result = "PROMOTED_CHAMPION"
+                self.best_ever_fitness = fitness_score
+                self.best_ever_genome = new_genome.copy()
+                self.best_ever_allele_id = allele_id
+                self.champion_stagnation_counter = 0
+                self.no_improvement_counter = 0
+                print(f"   NEW CHAMPION: {fitness_score:.4f}")
+            elif stability_score > 0.98 and fitness_delta > -0.005:
+                if random.random() < 0.25:
+                    accepted = True
+                    evaluation_result = "PROMOTED_SOFT"
+                    print(f"   SOFT PROMOTED: {fitness_score:.4f} (stability: {stability_score:.4f})")
+                else:
+                    accepted = False
+                    evaluation_result = "REJECTED_SOFT"
+            else:
+                accepted, evaluation_result = self.selector.evaluate_candidate(
+                    parent_fitness, parent_stability,
+                    fitness_score, stability_score
+                )
 
             parent_hash = MutationEngine.hash_genome(parent_genome)
             child_hash = MutationEngine.hash_genome(new_genome)
@@ -592,23 +648,6 @@ class EvolutionLoop:
             attributed_delta = delta_fitness / mutation_count if mutation_count > 0 else 0
 
             trial_id = uuid.uuid4().hex
-
-            prev_best = self.best_ever_fitness
-            if fitness_score > self.best_ever_fitness:
-                self.best_ever_fitness = fitness_score
-                self.best_ever_genome = new_genome.copy()
-                self.best_ever_allele_id = allele_id
-                self.champion_stagnation_counter = 0
-                self.no_improvement_counter = 0
-                print(f"   ?? NEW CHAMPION: {fitness_score:.4f}")
-                self.best_ever_allele_id = allele_id
-                self.no_improvement_counter = 0
-                print(f"   ?? New best observed: {fitness_score:.4f}")
-
-            # Champion override: always promote a new all-time best
-            if fitness_score > prev_best:
-                accepted = True
-                evaluation_result = "PROMOTED"
 
             print(f"[GEN {gen:3d}] parent={parent_fitness:>8.4f} candidate={fitness_score:>8.4f} champion={self.best_ever_fitness:>8.4f} | stability={stability_score:>8.4f} | {evaluation_result}")
 
@@ -661,25 +700,22 @@ class EvolutionLoop:
                 self.no_improvement_counter += 1
                 self.champion_stagnation_counter += 1
                 status = "?"
-                # If champion has stagnated for threshold generations, force macro jump
-                if self.champion_stagnation_counter >= self.champion_stagnation_threshold:
-                    print(f"   CHAMPION STAGNATION: Forcing macro jump at generation {gen}")
-                    self.no_improvement_counter = self.stagnation_threshold  # force macro_jump next mutation
-                    generations_since_improvement = 0  # reset plateau counter on macro jump
 
             if gen % 10 == 0:
                 print(f"   Gen {gen:3d}: {status} Fitness: {fitness_score:.3f} "
-                      f"(?: {delta_fitness:+.3f}) Active: {parent_fitness:.3f} "
+                      f"(Delta: {delta_fitness:+.3f}) Active: {parent_fitness:.3f} "
                       f"Stability: {stability_score:.3f} | Result: {evaluation_result}")
 
-            if generations_since_improvement >= self.plateau_generations:
-                print(f"\n   ?? Plateau detected at generation {gen}")
+            current_parent = self._get_active_allele()
+            parent_stability = current_parent.get("stability_score", 0) if current_parent else 0
+            if generations_since_improvement >= self.plateau_generations and parent_stability < 0.98:
+                print(f"\n   Plateau detected at generation {gen}")
                 stopped_early = True
                 final_gen = gen
                 break
 
         print("-" * 50)
-        print(f"? Evolution complete!")
+        print(f"Evolution complete!")
         print(f"   Successes: {success_count}")
         print(f"   Rejections: {reject_count}")
         print(f"   Best Fitness: {self.best_ever_fitness:.4f}")
@@ -700,12 +736,15 @@ class EvolutionLoop:
 # ENTRY POINT
 # ============================================================
 
-def run_evolutionary_loop(seed: int, generations: int, selector: SelectionEngine, seed_genome: str = None, debug: bool = False):
+def run_evolutionary_loop(seed: int, generations: int, selector: SelectionEngine, db_name: str = "meos_v0.3.db",
+                          seed_genome: str = None, debug: bool = False):
     """Main entry point for the evolutionary loop."""
-    print("?? DEBUG: Entered run_evolutionary_loop")
-    
+    if debug:
+        print("DEBUG: Entered run_evolutionary_loop")
+
     db = Database()
-    print("?? DEBUG: Database initialized")
+    if debug:
+        print("DEBUG: Database initialized")
 
     gene_id = str(uuid.uuid4())[:8]
     db.insert("genes", {
@@ -715,15 +754,21 @@ def run_evolutionary_loop(seed: int, generations: int, selector: SelectionEngine
         "best_fitness_ever": -1.0,
         "baseline_fitness": None
     })
-    print(f"?? DEBUG: Gene created: {gene_id}")
+    if debug:
+        print(f"DEBUG: Gene created: {gene_id}")
 
-    initial_genome = {"parallelism": 1, "cache_enabled": False, "cache_size": 0,
-                      "reranking_enabled": False, "batch_size": 10,
-                      "timeout_seconds": 30, "max_results": 50,
-                      "scoring_strategy": "cosine", "retrieval_depth": 10,
-                      "cache_eviction_policy": "lru", "ranking_model_temp": 0.5}
+    if seed_genome:
+        initial_genome = json.loads(seed_genome)
+        print(f"   Seeded with champion genome")
+    else:
+        initial_genome = {"parallelism": 1, "cache_enabled": False, "cache_size": 0,
+                          "reranking_enabled": False, "batch_size": 10,
+                          "timeout_seconds": 30, "max_results": 50,
+                          "scoring_strategy": "cosine", "retrieval_depth": 10,
+                          "cache_eviction_policy": "lru", "ranking_model_temp": 0.5}
 
-    print("?? DEBUG: Creating initial allele")
+    if debug:
+        print("DEBUG: Creating initial allele")
     allele_id = str(uuid.uuid4())[:8]
     db.insert("alleles", {
         "id": allele_id, "gene_id": gene_id, "version": 1,
@@ -735,8 +780,9 @@ def run_evolutionary_loop(seed: int, generations: int, selector: SelectionEngine
 
     fitness = FitnessFunction()
     benchmark_runner = BenchmarkRunner(fitness)
-    
-    print("?? DEBUG: Running initial benchmark")
+
+    if debug:
+        print("DEBUG: Running initial benchmark")
     results = benchmark_runner.run_multi_env_benchmark(allele_id, initial_genome)
     baseline_fitness = results["fitness"]
     baseline_stability = results["stability"]
@@ -745,7 +791,7 @@ def run_evolutionary_loop(seed: int, generations: int, selector: SelectionEngine
     db.execute("UPDATE alleles SET is_active = TRUE WHERE id = ?", (allele_id,))
     db.execute("UPDATE genes SET baseline_fitness = ? WHERE id = ?", (baseline_fitness, gene_id))
 
-    print(f"\n?? Gene: {gene_id}")
+    print(f"\nGene: {gene_id}")
     print(f"   Baseline fitness: {baseline_fitness:.3f}")
     print(f"   Baseline stability: {baseline_stability:.3f}")
     print(f"   Seed: {seed}")
@@ -762,7 +808,9 @@ def run_evolutionary_loop(seed: int, generations: int, selector: SelectionEngine
         "total_generations": generations
     })
 
-    loop = EvolutionLoop(gene_id, db, run_id, generations, seed, baseline_fitness, initial_allele_id=allele_id, initial_genome=initial_genome, selector=selector)
+    loop = EvolutionLoop(gene_id, db, run_id, generations, seed, baseline_fitness,
+                         initial_allele_id=allele_id, initial_genome=initial_genome,
+                         selector=selector)
     result = loop.run()
 
     success = result["best_fitness"] > 0.95
@@ -773,10 +821,43 @@ def run_evolutionary_loop(seed: int, generations: int, selector: SelectionEngine
 
     print("\n" + "=" * 60)
     if success:
-        print("? Experiment succeeded!")
+        print("Experiment succeeded!")
     else:
-        print("? Experiment failed.")
+        print("Experiment failed.")
     print(f"   Best Fitness: {result['best_fitness']:.4f}")
     print(f"   Improvement: {result['improvement']:.2%}")
 
+    # Ensure database is initialized
+    if debug:
+        print("DEBUG: Creating EvolutionLoop")
+    
+    loop = EvolutionLoop(
+        gene_id=gene_id,
+        db=db,
+        experiment_id=run_id,
+        num_generations=generations,
+        seed=seed,
+        baseline_fitness=baseline_fitness,
+        initial_allele_id=allele_id,
+        initial_genome=initial_genome,
+        selector=selector
+    )
+    
+    return loop.run()
 
+if __name__ == "__main__":
+    # This block allows direct testing
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--generations", type=int, default=100)
+    parser.add_argument("--threshold", type=float, default=0.89)
+    args = parser.parse_args()
+    
+    from src.selection.selection_engine import SelectionEngine
+    selector = SelectionEngine(target_threshold=args.threshold)
+    
+    run_evolutionary_loop(args.seed, args.generations, selector)
+# Your new code goes here
+def new_feature_function():
+    print("Feature added via CLI!")
