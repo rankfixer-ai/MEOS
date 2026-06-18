@@ -537,6 +537,22 @@ class EvolutionLoop:
             "random_seed": row[9] if len(row) > 9 else 0
         }
 
+    def _print_archive_summary(self):
+        rows = self.db.execute(
+            "SELECT COUNT(*), MAX(fitness_score), MIN(fitness_score) FROM alleles WHERE gene_id = ?",
+            (self.gene_id,)
+        )
+        if not rows:
+            return
+        total, best, worst = rows[0]
+        print()
+        print(f"   [ARCHIVE SUMMARY]")
+        print(f"   Alleles recorded: {total}")
+        if best is not None:
+            print(f"   Best fitness:  {float(best):.4f}")
+        if worst is not None:
+            print(f"   Worst fitness: {float(worst):.4f}")
+
     def run(self) -> Dict:
         print(f"\nStarting evolution for seed: {self.seed}")
         print(f"   Generations: {self.num_generations}")
@@ -737,6 +753,7 @@ class EvolutionLoop:
                 break
 
         print("-" * 50)
+        self._print_archive_summary()
         print(f"Evolution complete!")
         print(f"   Successes: {success_count}")
         print(f"   Rejections: {reject_count}")
